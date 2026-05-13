@@ -218,10 +218,9 @@ pub(crate) fn set_update_stmt_journal_flags(
     // collected rows, so affects_max_1_row() returns false — multi_write stays true.
     let is_single_row =
         plan.limit.is_none() && plan.offset.is_none() && target_table.op.affects_max_1_row();
-    if is_single_row && !has_triggers && !any_replace && !has_fks {
-        if !plan.returning.as_ref().is_some_and(|r| !r.is_empty()) {
-            program.set_multi_write(false);
-        }
+    let has_returning = plan.returning.as_ref().is_some_and(|r| !r.is_empty());
+    if is_single_row && !has_triggers && !any_replace && !has_fks && !has_returning {
+        program.set_multi_write(false);
     }
 
     let has_notnull_cols = plan.set_clauses.iter().any(|set_clause| {
@@ -239,7 +238,7 @@ pub(crate) fn set_update_stmt_journal_flags(
 
     let may_abort = has_triggers
         || has_fks
-        || plan.returning.as_ref().is_some_and(|r| !r.is_empty())
+        || has_returning
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
