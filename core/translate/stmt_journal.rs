@@ -26,7 +26,7 @@ use crate::translate::plan::{DeletePlan, DmlSafetyReason, UpdatePlan};
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::vdbe::builder::ProgramBuilder;
 use crate::{sync::Arc, Connection, Result};
-use turso_parser::ast::{ResolveType, TriggerEvent};
+use turso_parser::ast::{Expr, ResolveType, TriggerEvent};
 
 /// Check whether any DDL-level constraint (IPK or index) uses REPLACE.
 pub(crate) fn any_index_or_ipk_has_replace(
@@ -64,6 +64,98 @@ fn table_has_fks(
     connection.foreign_keys_enabled()
         && (resolver.with_schema(database_id, |s| s.has_child_fks(table_name))
             || resolver.with_schema(database_id, |s| s.any_resolved_fks_referencing(table_name)))
+}
+
+fn expr_may_abort_during_row_eval(expr: &Expr) -> bool {
+    let mut stack = vec![expr];
+    while let Some(node) = stack.pop() {
+        match node {
+            Expr::FunctionCall { .. }
+            | Expr::FunctionCallStar { .. }
+            | Expr::Like { .. }
+            | Expr::Subquery(_)
+            | Expr::InSelect { .. }
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::Raise(_, _) => return true,
+            Expr::Between {
+                lhs, start, end, ..
+            } => {
+                stack.push(lhs.as_ref());
+                stack.push(start.as_ref());
+                stack.push(end.as_ref());
+            }
+            Expr::Binary(lhs, _, rhs) => {
+                stack.push(lhs.as_ref());
+                stack.push(rhs.as_ref());
+            }
+            Expr::Case {
+                base,
+                when_then_pairs,
+                else_expr,
+            } => {
+                if let Some(expr) = base.as_deref() {
+                    stack.push(expr);
+                }
+                for (when_expr, then_expr) in when_then_pairs {
+                    stack.push(when_expr.as_ref());
+                    stack.push(then_expr.as_ref());
+                }
+                if let Some(expr) = else_expr.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::Cast { expr, .. }
+            | Expr::Collate(expr, _)
+            | Expr::IsNull(expr)
+            | Expr::NotNull(expr)
+            | Expr::Unary(_, expr) => {
+                stack.push(expr.as_ref());
+            }
+            Expr::InList { lhs, rhs, .. } => {
+                stack.push(lhs.as_ref());
+                for expr in rhs {
+                    stack.push(expr.as_ref());
+                }
+            }
+            Expr::Parenthesized(exprs) => {
+                for expr in exprs {
+                    stack.push(expr.as_ref());
+                }
+            }
+            Expr::SubqueryResult { lhs, .. } => {
+                if let Some(expr) = lhs.as_deref() {
+                    stack.push(expr);
+                }
+            }
+            Expr::Array { .. } | Expr::Subscript { .. } => {
+                unreachable!("Array and Subscript are desugared into function calls by the parser")
+            }
+            Expr::Column { .. }
+            | Expr::DoublyQualified(_, _, _)
+            | Expr::Id(_)
+            | Expr::Literal(_)
+            | Expr::Name(_)
+            | Expr::Qualified(_, _)
+            | Expr::FieldAccess { .. }
+            | Expr::Register(_)
+            | Expr::RowId { .. }
+            | Expr::Variable(_)
+            | Expr::Default => {}
+        }
+    }
+    false
+}
+
+fn index_expr_may_abort(index: &crate::schema::Index) -> bool {
+    index.columns.iter().any(|col| {
+        col.expr
+            .as_deref()
+            .is_some_and(expr_may_abort_during_row_eval)
+    }) || index
+        .where_clause
+        .as_deref()
+        .is_some_and(expr_may_abort_during_row_eval)
 }
 
 /// Determine whether any constraint's effective resolution can trigger an
@@ -230,9 +322,18 @@ pub(crate) fn set_update_stmt_journal_flags(
     let has_check = !btree_table.check_constraints.is_empty();
     let has_unique =
         !btree_table.unique_sets.is_empty() || plan.indexes_to_update.iter().any(|idx| idx.unique);
+    let expr_eval_may_abort = plan
+        .set_clauses
+        .iter()
+        .any(|set_clause| expr_may_abort_during_row_eval(set_clause.emitted_expr()))
+        || plan
+            .indexes_to_update
+            .iter()
+            .any(|idx| index_expr_may_abort(idx));
 
     let may_abort = has_triggers
         || has_fks
+        || expr_eval_may_abort
         || constraint_may_abort(
             has_statement_conflict,
             or_conflict,
